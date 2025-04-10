@@ -18,7 +18,7 @@ from ._linux._capabilities import try_use_cap_kill
 from ._linux._sudo import find_sudo_child_process_group_id
 from ._logging import LoggerAdapter, LogContent, LogExtraInfo
 from ._os_checker import is_linux, is_posix, is_windows
-from ._session_user import PosixSessionUser, WindowsSessionUser, SessionUser
+from ._session_user import PosixSessionUser, WindowsSessionUser, SessionUser, CURRENT_PROCESS_RUNNING_IN_WINDOWS_SESSION_0
 
 if is_windows():  # pragma: nocover
     from subprocess import CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW  # type: ignore
@@ -607,18 +607,55 @@ class LoggingSubprocess(object):
             str(WINDOWS_SIGNAL_SUBPROC_SCRIPT_PATH),
             str(self._process.pid),
         ]
-        result = run(
-            cmd,
-            stdout=PIPE,
-            stderr=STDOUT,
-            stdin=DEVNULL,
-            creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-        )
-        if result.returncode != 0:
-            self._logger.warning(
-                f"Failed to send signal 'CTRL_BREAK_EVENT' to subprocess {self._process.pid}: %s",
-                result.stdout.decode("utf-8"),
-                extra=LogExtraInfo(
-                    openjd_log_content=LogContent.PROCESS_CONTROL | LogContent.EXCEPTION_INFO
-                ),
+        
+        # When running in session 0 as a service and the subprocess is running as a different user,
+        # we need to run the signal script as that user to have the necessary permissions
+        if CURRENT_PROCESS_RUNNING_IN_WINDOWS_SESSION_0 and self._user and not self._user.is_process_user():
+            user = cast(WindowsSessionUser, self._user)
+            from ._win32._popen_as_user import PopenWindowsAsUser
+            
+            try:
+                # Run the signal script as the same user as the target process
+                process = PopenWindowsAsUser(
+                    user,
+                    cmd,
+                    stdout=PIPE,
+                    stderr=STDOUT,
+                    stdin=DEVNULL,
+                    creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                )
+                stdout, _ = process.communicate()
+                result_code = process.returncode
+                result_output = stdout.decode("utf-8") if stdout else ""
+                
+                if result_code != 0:
+                    self._logger.warning(
+                        f"Failed to send signal 'CTRL_BREAK_EVENT' to subprocess {self._process.pid}: {result_output}",
+                        extra=LogExtraInfo(
+                            openjd_log_content=LogContent.PROCESS_CONTROL | LogContent.EXCEPTION_INFO
+                        ),
+                    )
+            except Exception as e:
+                self._logger.warning(
+                    f"Failed to send signal 'CTRL_BREAK_EVENT' to subprocess {self._process.pid}: {str(e)}",
+                    extra=LogExtraInfo(
+                        openjd_log_content=LogContent.PROCESS_CONTROL | LogContent.EXCEPTION_INFO
+                    ),
+                )
+        else:
+            # Standard case - run the signal script as the current user
+            result = run(
+                cmd,
+                stdout=PIPE,
+                stderr=STDOUT,
+                stdin=DEVNULL,
+                creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
+            if result.returncode != 0:
+                self._logger.warning(
+                    f"Failed to send signal 'CTRL_BREAK_EVENT' to subprocess {self._process.pid}: %s",
+                    result.stdout.decode("utf-8"),
+                    extra=LogExtraInfo(
+                        openjd_log_content=LogContent.PROCESS_CONTROL | LogContent.EXCEPTION_INFO
+                    ),
+                )
